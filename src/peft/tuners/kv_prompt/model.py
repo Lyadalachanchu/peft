@@ -207,7 +207,17 @@ class KVPromptModel(BaseTuner):
         num_heads = getattr(target, "num_heads", None) or getattr(config, "num_attention_heads", None)
         config_num_kv = getattr(config, "num_key_value_heads", None) if config is not None else None
 
-        if head_dim is None and config is not None:
+        def _out_features(linear: nn.Module | None) -> Optional[int]:
+            if linear is None:
+                return None
+            out_features = getattr(linear, "out_features", None)
+            if out_features is None and hasattr(linear, "weight"):
+                weight = linear.weight
+                if isinstance(weight, torch.Tensor):
+                    out_features = weight.shape[0]
+            return out_features
+
+        if head_dim is None:
             head_dim = getattr(config, "head_dim", None)
         if head_dim is None and config is not None:
             hidden_size = getattr(config, "hidden_size", None)
@@ -216,24 +226,16 @@ class KVPromptModel(BaseTuner):
 
         q_proj = getattr(target, "q_proj", None)
         if head_dim is None and q_proj is not None:
-            out_features = getattr(q_proj, "out_features", None)
-            if out_features is not None and num_heads:
-                head_dim = out_features // num_heads
+            q_out = _out_features(q_proj)
+            if q_out is not None and num_heads:
+                head_dim = q_out // num_heads
 
         k_proj = getattr(target, "k_proj", None)
-        candidate_heads = num_kv_heads or num_heads
-        if head_dim is None and k_proj is not None:
-            out_features = getattr(k_proj, "out_features", None)
-            if out_features is not None and candidate_heads:
-                head_dim = out_features // candidate_heads
-
         kv_from_proj = None
-        if k_proj is not None and head_dim is not None:
-            out_features = getattr(k_proj, "out_features", None)
-            if out_features is None and hasattr(k_proj, "weight"):
-                out_features = k_proj.weight.shape[0]
-            if out_features is not None:
-                kv_from_proj = out_features // head_dim if head_dim != 0 else None
+        if head_dim not in (None, 0):
+            k_out = _out_features(k_proj)
+            if k_out is not None:
+                kv_from_proj = k_out // head_dim
 
         if kv_from_proj is not None:
             num_kv_heads = kv_from_proj
@@ -241,11 +243,6 @@ class KVPromptModel(BaseTuner):
             num_kv_heads = config_num_kv
         if num_kv_heads is None:
             num_kv_heads = num_heads
-
-        if num_kv_heads is None and head_dim is not None and k_proj is not None:
-            out_features = getattr(k_proj, "out_features", None)
-            if out_features is not None and head_dim != 0:
-                num_kv_heads = out_features // head_dim
 
         return num_kv_heads, head_dim
 

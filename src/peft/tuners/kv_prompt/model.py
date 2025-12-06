@@ -205,9 +205,10 @@ class KVPromptModel(BaseTuner):
 
         config = getattr(target, "config", None)
         num_heads = getattr(target, "num_heads", None) or getattr(config, "num_attention_heads", None)
+        config_num_kv = getattr(config, "num_key_value_heads", None) if config is not None else None
 
-        if num_kv_heads is None and config is not None:
-            num_kv_heads = getattr(config, "num_key_value_heads", None)
+        if num_kv_heads is None and config_num_kv is not None:
+            num_kv_heads = config_num_kv
         if num_kv_heads is None:
             num_kv_heads = num_heads
 

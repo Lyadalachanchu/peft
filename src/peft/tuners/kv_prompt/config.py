@@ -35,8 +35,6 @@ class KVPromptConfig(PeftConfig):
     target_layers: Optional[List[int]] = None
     affect_keys: bool = True
     affect_values: bool = True
-    #???
-    init_std: float = 0.0
 
     def __post_init__(self):
         if self.peft_type is None:

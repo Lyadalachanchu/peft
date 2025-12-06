@@ -47,7 +47,6 @@ class KVPromptAdapter(nn.Module):
         prompt_length: length of the prompt (S_p). If None, use full S.
         """
         B, H, S, d = key_states.shape
-        assert H == self.num_kv_heads and d == self.head_dim
 
         if prompt_length is None:
             idx = S - 1

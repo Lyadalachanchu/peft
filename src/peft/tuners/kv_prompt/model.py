@@ -198,6 +198,46 @@ class KVPromptModel(BaseTuner):
             return False
         return layer_idx in peft_config.target_layers
 
+    @staticmethod
+    def _infer_attention_metadata(target: nn.Module) -> tuple[Optional[int], Optional[int]]:
+        num_kv_heads = getattr(target, "num_key_value_heads", None)
+        head_dim = getattr(target, "head_dim", None)
+
+        config = getattr(target, "config", None)
+        num_heads = getattr(target, "num_heads", None) or getattr(config, "num_attention_heads", None)
+
+        if num_kv_heads is None and config is not None:
+            num_kv_heads = getattr(config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
+        if head_dim is None and config is not None:
+            head_dim = getattr(config, "head_dim", None)
+        if head_dim is None and config is not None:
+            hidden_size = getattr(config, "hidden_size", None)
+            if hidden_size is not None and num_heads:
+                head_dim = hidden_size // num_heads
+
+        q_proj = getattr(target, "q_proj", None)
+        if head_dim is None and q_proj is not None:
+            out_features = getattr(q_proj, "out_features", None)
+            if out_features is not None and num_heads:
+                head_dim = out_features // num_heads
+
+        k_proj = getattr(target, "k_proj", None)
+        if head_dim is None and k_proj is not None:
+            out_features = getattr(k_proj, "out_features", None)
+            candidate_heads = num_kv_heads or num_heads
+            if out_features is not None and candidate_heads:
+                head_dim = out_features // candidate_heads
+
+        if num_kv_heads is None and head_dim is not None and k_proj is not None:
+            out_features = getattr(k_proj, "out_features", None)
+            if out_features is not None and head_dim != 0:
+                num_kv_heads = out_features // head_dim
+
+        return num_kv_heads, head_dim
+
     def _create_and_replace(
         self,
         peft_config: KVPromptConfig,
@@ -213,8 +253,7 @@ class KVPromptModel(BaseTuner):
                 self.targeted_module_names.pop()
             return
 
-        num_kv_heads = getattr(target, "num_key_value_heads", getattr(target, "num_heads", None))
-        head_dim = getattr(target, "head_dim", None)
+        num_kv_heads, head_dim = self._infer_attention_metadata(target)
 
         if num_kv_heads is None or head_dim is None:
             raise ValueError(

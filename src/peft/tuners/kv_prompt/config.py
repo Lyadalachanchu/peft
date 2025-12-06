@@ -33,6 +33,7 @@ class KVPromptConfig(PeftConfig):
     """
 
     target_layers: Optional[List[int]] = None
+    target_modules: Optional[List[str]] = None
     affect_keys: bool = True
     affect_values: bool = True
 
@@ -51,4 +52,3 @@ class KVPromptConfig(PeftConfig):
 
         # Let parent perform its own checks (optional, depending on version)
         super().__post_init__() if hasattr(super(), "__post_init__") else None
-

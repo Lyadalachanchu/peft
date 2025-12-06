@@ -30,13 +30,13 @@ class KVPromptWrappedAttention(nn.Module, BaseTunerLayer):
         self._disable_adapters = False
         self.merged_adapters: list[str] = []
 
-        # copy all attributes that the rest of the model expects
-        for name, value in base_attn.__dict__.items():
-            if name.startswith("_") or name in ("base_layer", "kv_prompt_adapters"):
-                continue
-            setattr(self, name, value)
-
         self.update_layer(adapter_name, **adapter_kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
 
     def update_layer(
         self,

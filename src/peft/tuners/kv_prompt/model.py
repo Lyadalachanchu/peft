@@ -71,9 +71,9 @@ class KVPromptWrappedAttention(nn.Module, BaseTunerLayer):
         prompt_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         for adapter_name in self.active_adapters:
-            adapter = self.kv_prompt_adapters.get(adapter_name)
+            adapter = self.kv_prompt_adapters[adapter_name] if adapter_name in self.kv_prompt_adapters else None
             if adapter is None:
-                continue
+                raise ValueError(f"Adapter '{adapter_name}' not found in kv_prompt_adapters.")
             key_states, value_states = adapter(
                 key_states,
                 value_states,

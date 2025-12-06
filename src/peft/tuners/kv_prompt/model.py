@@ -1,31 +1,85 @@
 from __future__ import annotations
+
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from peft.peft_model import PeftModel
-from peft.utils import PeftType
+from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from .config import KVPromptConfig
 from .layer import KVPromptAdapter
-from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+from transformers.models.qwen3.modeling_qwen3 import (
+    ALL_ATTENTION_FUNCTIONS,
+    apply_rotary_pos_emb,
+)
 
 
-class KVPromptWrappedAttention(nn.Module):
+class KVPromptWrappedAttention(nn.Module, BaseTunerLayer):
     """
     Wrap a decoder self-attention module and inject ΔK/ΔV at the last prompt
     position on the *prompt pass* (when past_key_value is None).
     """
-    def __init__(self, base_attn: nn.Module, kv_adapter: KVPromptAdapter):
+
+    adapter_layer_names = ("kv_prompt_adapters",)
+
+    def __init__(self, base_attn: nn.Module, adapter_name: str, **adapter_kwargs):
         super().__init__()
-        self.base_attn = base_attn
-        self.kv_adapter = kv_adapter
+        self.base_layer = base_attn
+        self.kv_prompt_adapters = nn.ModuleDict({})
+        self._active_adapter = adapter_name
+        self._disable_adapters = False
+        self.merged_adapters: list[str] = []
 
         # copy all attributes that the rest of the model expects
         for name, value in base_attn.__dict__.items():
-            if name.startswith("_") or name in ("base_attn", "kv_adapter"):
+            if name.startswith("_") or name in ("base_layer", "kv_prompt_adapters"):
                 continue
             setattr(self, name, value)
+
+        self.update_layer(adapter_name, **adapter_kwargs)
+
+    def update_layer(
+        self,
+        adapter_name: str,
+        num_kv_heads: int,
+        head_dim: int,
+        affect_keys: bool,
+        affect_values: bool,
+        inference_mode: bool = False,
+        **kwargs,
+    ):
+        adapter = KVPromptAdapter(
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            affect_keys=affect_keys,
+            affect_values=affect_values,
+        )
+        self.kv_prompt_adapters[adapter_name] = adapter
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        raise NotImplementedError("KV prompt adapters cannot be merged into the base model.")
+
+    def unmerge(self) -> None:
+        raise NotImplementedError("KV prompt adapters do not support merging/unmerging.")
+
+    def _apply_adapters(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        prompt_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for adapter_name in self.active_adapters:
+            adapter = self.kv_prompt_adapters.get(adapter_name)
+            if adapter is None:
+                continue
+            key_states, value_states = adapter(
+                key_states,
+                value_states,
+                prompt_length=prompt_length,
+            )
+        return key_states, value_states
 
     def forward(
         self,
@@ -36,6 +90,18 @@ class KVPromptWrappedAttention(nn.Module):
         cache_position=None,
         **kwargs,
     ):
+        if self.disable_adapters or not self.active_adapters:
+            if self.merged:
+                self.unmerge()
+            return self.base_layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
         # ----------- ORIGINAL QWEN3 CODE -----------
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -60,14 +126,10 @@ class KVPromptWrappedAttention(nn.Module):
         )
 
         # ----------- OUR INSERTION POINT -----------
-        if past_key_values is None:
+        if past_key_values is None and self.active_adapters:
             # prompt_length = full sequence length
             prompt_length = key_states.shape[2]
-            key_states, value_states = self.kv_adapter(
-                key_states,
-                value_states,
-                prompt_length=prompt_length,
-            )
+            key_states, value_states = self._apply_adapters(key_states, value_states, prompt_length)
 
         # ----------- CACHING LOGIC -----------
         if past_key_values is not None:
@@ -82,6 +144,7 @@ class KVPromptWrappedAttention(nn.Module):
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_fn]
         else:
             from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
+
             attention_interface = eager_attention_forward
 
         attn_output, attn_weights = attention_interface(
@@ -101,10 +164,9 @@ class KVPromptWrappedAttention(nn.Module):
         return attn_output, attn_weights
 
 
-
-class KVPromptModel(PeftModel):
+class KVPromptModel(BaseTuner):
     """
-    PEFT model for KV-prompt tuning.
+    BaseTuner implementation for KV prompt adapters.
 
     This:
       - freezes the base model,
@@ -112,82 +174,64 @@ class KVPromptModel(PeftModel):
       - wraps each layer's self-attention to call the adapter.
     """
 
-    def __init__(self, model: nn.Module, peft_config: KVPromptConfig, adapter_name: str = "default"):
-        # Note to myself: PeftModel takes (model, peft_config, adapter_name)
-        super().__init__(model, peft_config, adapter_name)
-        self.peft_type = PeftType.KV_PROMPT
-        self._prepare_kv_prompt(adapter_name)
+    prefix: str = "kv_prompt_"
+    tuner_layer_cls = KVPromptWrappedAttention
 
-    def _freeze_base_model(self):
-        for p in self.get_base_model().parameters():
-            p.requires_grad = False
+    def _prepare_adapter_config(self, peft_config: KVPromptConfig, model_config: dict) -> KVPromptConfig:
+        if peft_config.target_modules is None:
+            peft_config.target_modules = ["self_attn"]
+        return peft_config
 
-    def _prepare_kv_prompt(self, adapter_name: str):
-        peft_config: KVPromptConfig = self.peft_config[adapter_name]
+    @staticmethod
+    def _extract_layer_idx(module_key: str) -> Optional[int]:
+        parts = module_key.split(".")
+        for idx, name in enumerate(parts[:-1]):
+            if name == "layers" and parts[idx + 1].isdigit():
+                return int(parts[idx + 1])
+        return None
 
-        self._freeze_base_model()
+    def _should_adapt_layer(self, peft_config: KVPromptConfig, module_key: str) -> bool:
+        if peft_config.target_layers is None:
+            return True
+        layer_idx = self._extract_layer_idx(module_key)
+        if layer_idx is None:
+            return False
+        return layer_idx in peft_config.target_layers
 
-        base = self.get_base_model()
+    def _create_and_replace(
+        self,
+        peft_config: KVPromptConfig,
+        adapter_name: str,
+        target: nn.Module,
+        target_name: str,
+        parent: nn.Module,
+        current_key: str,
+        **kwargs,
+    ) -> None:
+        if not self._should_adapt_layer(peft_config, current_key):
+            if self.targeted_module_names:
+                self.targeted_module_names.pop()
+            return
 
-        # For Qwen/LLaMA-style models: base.model.layers is a list of decoder blocks (from chat)
-        if hasattr(base, "model") and hasattr(base.model, "layers"):
-            decoder_layers = base.model.layers
-        elif hasattr(base, "layers"):
-            decoder_layers = base.layers
-        else:
+        num_kv_heads = getattr(target, "num_key_value_heads", getattr(target, "num_heads", None))
+        head_dim = getattr(target, "head_dim", None)
+
+        if num_kv_heads is None or head_dim is None:
             raise ValueError(
-                "KVPromptModel: could not find decoder layers. "
-                "Extend _prepare_kv_prompt for your model architecture."
+                f"KVPromptModel: could not infer (num_kv_heads, head_dim) for module '{current_key}'."
             )
 
-        num_layers = len(decoder_layers)
+        adapter_kwargs = dict(
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            affect_keys=peft_config.affect_keys,
+            affect_values=peft_config.affect_values,
+        )
 
-        if peft.config.target_layers is None:
-            target_layers = list(range(num_layers))
+        if isinstance(target, KVPromptWrappedAttention):
+            target.update_layer(adapter_name, **adapter_kwargs, inference_mode=peft_config.inference_mode)
         else:
-            target_layers = peft_config.target_layers
-
-        # create adapters and wrap attention in each target layer
-        for layer_idx, layer in enumerate(decoder_layers):
-            if layer_idx not in target_layers:
-                continue
-
-            if not hasattr(layer, "self_attn"):
-                raise ValueError(
-                    f"KVPromptModel: layer {layer_idx} has no `self_attn` attribute."
-                )
-
-            attn = layer.self_attn
-            # for Qwen/LLaMA-style, attention module exposes num_key_value_heads / head_dim (chat)
-            num_kv_heads = getattr(attn, "num_key_value_heads", getattr(attn, "num_heads", None))
-            head_dim = getattr(attn, "head_dim", None)
-
-            if num_kv_heads is None or head_dim is None:
-                raise ValueError(
-                    f"KVPromptModel: could not infer (num_kv_heads, head_dim) for layer {layer_idx}."
-                )
-
-            kv_adapter = KVPromptAdapter(
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    affect_keys=peft_config.affect_keys,
-                    affect_values=peft_config.affect_values,
-                )
-
-            layer.kv_prompt_adapter = kv_adapter
-
-            # wrap attention
-            # TODO: implement KVPromptWrappedAttention
-            wrapped_attn = KVPromptWrappedAttention(attn, kv_adapter)
-            layer.self_attn = wrapped_attn
-
-            #mark only KVPrompt params as trainable
-            for name, param in self.named_parameters():
-                if "kv_prompt_adapter" in name:
-                    param.requires_grad = True
-                else:
-                    # Do not unfreeze any other PEFT parameters; base mode is frozen
-                    param.requires_grad = getattr(param, "requires_grad", False)
-
-
-
+            new_module = KVPromptWrappedAttention(target, adapter_name, **adapter_kwargs)
+            if adapter_name not in self.active_adapters:
+                new_module.requires_grad_(False)
+            self._replace_module(parent, target_name, new_module, target)

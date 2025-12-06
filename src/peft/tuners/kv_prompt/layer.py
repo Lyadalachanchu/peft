@@ -27,7 +27,7 @@ class KVPromptAdapter(nn.Module):
         self.affect_values = affect_values
 
         if affect_keys:
-            self.delta_k = nn.Parameter(torch.zeros(num_kv, head_dim))
+            self.delta_k = nn.Parameter(torch.zeros(num_kv_heads, head_dim))
         else:
             self.register_parameter("delta_k", None)
 

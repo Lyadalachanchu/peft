@@ -54,12 +54,28 @@ class KVPromptAdapter(nn.Module):
         else:
             idx = prompt_length - 1
 
-        if self.delta_k is not None:
-            dk = self.delta_k[None, :, None, :]  # (1, H, 1, d)
+        def _expand_delta(delta: torch.Tensor | None):
+            if delta is None:
+                return None
+            if H == delta.shape[0]:
+                return delta
+            if H % delta.shape[0] != 0:
+                raise ValueError(
+                    f"KVPromptAdapter: cannot broadcast delta with head count {delta.shape[0]} "
+                    f"to key/value states with {H} heads."
+                )
+            repeat_factor = H // delta.shape[0]
+            return delta.repeat_interleave(repeat_factor, dim=0)
+
+        expanded_delta_k = _expand_delta(self.delta_k)
+        expanded_delta_v = _expand_delta(self.delta_v)
+
+        if expanded_delta_k is not None:
+            dk = expanded_delta_k[None, :, None, :]  # (1, H, 1, d)
             key_states[:, :, idx, :] = key_states[:, :, idx, :] + dk
 
-        if self.delta_v is not None:
-            dv = self.delta_v[None, :, None, :]
+        if expanded_delta_v is not None:
+            dv = expanded_delta_v[None, :, None, :]
             value_states[:, :, idx, :] = value_states[:, :, idx, :] + dv
 
         return key_states, value_states

@@ -82,6 +82,7 @@ class PeftType(str, enum.Enum):
     OSF = "OSF"
     DELORA = "DELORA"
     GRALORA = "GRALORA"
+    KV_PROMPT = "KV_PROMPT"
 
 
 class TaskType(str, enum.Enum):
